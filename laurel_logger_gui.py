@@ -7,15 +7,17 @@ import time
 import csv
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 class MeasurementType(Enum):
     CURRENT = "CURRENT"
     PEAK = "PEAK"
     VALLEY = "VALLEY"
 
-def send_laurel_command(server_address, server_port, device_address:int, command_function, sub_command, response_length=1024):
+def send_laurel_command(server_address, server_port, device_address:int, command_function, sub_command, response_length=1024, timeout=0.5):
     message = f"*{device_address}{command_function}{sub_command}\r\n"
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
         s.connect((server_address, server_port))
         s.sendall(message.encode())
         return s.recv(response_length)
@@ -73,31 +75,41 @@ def get_next_log_filename(base_name):
 event = threading.Event()
 # Function to collect data from nodes
 def collect_data(node_dict, seconds_between_samples=0.1):
-    # global event
     print(f"logging on nodes {node_dict}")
+    file_name = get_next_log_filename("readout_data")
     nodes = []
     last_time = time.time()
-    for ip in node_dict:
+    for ip,mac in node_dict:
         nodes.append(ip)
-    with open(get_next_log_filename("ROPS_force_press_log"), "w", newline="") as csvfile:
+    with open(file_name, "w", newline="") as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(["Time"] + nodes)
-    while True:
-        print("loop")
-        if event.is_set():
-            print("event set, exiting")
-            break
-        while time.time() - last_time < seconds_between_samples:
-            pass
-        with open("laurel_values.csv", "a", newline="") as csvfile:
-            csvwriter = csv.writer(csvfile)
+    
+    def get_values(ip):
+        value = get_laurel_value(ip)
+        return (ip, value)
+
+    with ThreadPoolExecutor() as executor:
+        while collect_data_flag:
+            if event.is_set():
+                executor.shutdown()
+                print("event set, exiting")
+                time.sleep(1)
+                break
+            while time.time() - last_time < seconds_between_samples:
+                time.sleep(0.0001)
+            
             node_values = []
-            last_time = time.time()     
-            for ip in node_dict:
-                value = get_laurel_value(ip)
-                node_values.append(value)
-                readouts[ip].set(f"{ip}: {value}")
-            csvwriter.writerow([time.time()] + node_values)            
+            last_time = time.time()
+            futures = [executor.submit(get_values, ip) for ip in nodes]
+            results = [future.result() for future in futures]
+
+            with open(file_name, "a", newline="") as csvfile:
+                csvwriter = csv.writer(csvfile)
+                for ip, value in results:
+                    node_values.append(value)
+                    readouts[ip].set(f"{ip}: {value}")
+                csvwriter.writerow([time.time()] + node_values)
     print("loop ended!")
 
 # Button callbacks
@@ -106,16 +118,24 @@ def scan_nodes():
     global root
     status_label.configure(text="Status: Scanning for Nodes (Takes 20s)")
     root.update()
+    global node_dict
+    global node_labels
+    global readouts
+    # reset node dict and destroy existing labels
+    node_dict = {} # delete and clear node dict
+    for ip in node_labels: # delete and clear labels
+        node_labels[ip].destroy()
+    node_labels = {}
+    readouts = {} # delete and clear readouts
+
     node_dict = scan_udp_broadcasts()
+    print(f"Found nodes: {node_dict}")
     status_label.configure(text="Status: Done Scanning")
 
     for ip, mac in node_dict:
-        if ip not in readouts:
-            readouts[ip] = tk.StringVar(value=f"{ip}: N/A")
-            tk.Label(main_frame, textvariable=readouts[ip]).pack()
-        else:
-            readouts[ip].set(f"{ip}: N/A")
-
+        readouts[ip] = tk.StringVar(value=f"{ip}: N/A")
+        node_labels[ip] = tk.Label(main_frame, textvariable=readouts[ip])
+        node_labels[ip].pack()
 
 def start_stop_logging():
     global status_label
@@ -136,13 +156,12 @@ def start_stop_logging():
         status_label.configure(text="Status: Stopped Scanning")
         root.update()
         print("setting event")
-        event.set()
-        time.sleep(1)
+        # event.set()
+        print(f"thread is alive: {data_collection_thread.is_alive()}")
+        collect_data_flag = False
         print("joining thread")
-        print(data_collection_thread.is_alive())
         data_collection_thread.join()
         print("join complete")
-        collect_data_flag = False
 
 # GUI setup
 root = tk.Tk()
@@ -162,13 +181,17 @@ start_button = tk.Button(main_frame, text="Start/Stop Logging", command=start_st
 start_button.pack()
 
 
+node_label = tk.Label(main_frame, text="Known nodes and Current Values")
+node_label.pack()
 readouts = {}
-node_dict = {"10.11.1.13": "", "10.11.1.105": ""}
+node_dict = {"10.11.1.13": "N/A", "10.11.1.105": "N/A"}
+node_labels = {}
 
 for ip in node_dict:
     if ip not in readouts:
-        readouts[ip] = tk.StringVar(value=f"{ip}:")
-        tk.Label(main_frame, textvariable=readouts[ip]).pack()
+        readouts[ip] = tk.StringVar(value=f"{ip}: {node_dict[ip]}")
+        node_labels[ip] = tk.Label(main_frame, textvariable=readouts[ip])
+        node_labels[ip].pack()
 
 collect_data_flag = False
 
